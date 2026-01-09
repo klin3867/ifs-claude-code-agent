@@ -9,7 +9,7 @@ anthropic_model: claude-sonnet-4-20250514
 openai_model: o3
 
 # Prompts directory (relative to this config file)
-prompts_dir: ../../ifs-prompts
+prompts_dir: ../ifs-prompts
 
 # Variables file for prompt templates
 prompt_variables_file: prompt_variables.yaml
