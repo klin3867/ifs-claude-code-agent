@@ -1,0 +1,11 @@
+# Core
+anthropic>=0.18.0
+openai>=1.0.0
+httpx>=0.24.0
+pyyaml>=6.0
+python-dotenv>=1.0.0
+
+# Optional: Flask UI (if using app_flask.py from LEGACY)
+# flask>=2.0.0
+# sentence-transformers>=2.2.0
+# torch>=2.0.0

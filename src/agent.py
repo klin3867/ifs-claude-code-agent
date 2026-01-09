@@ -1,0 +1,836 @@
+"""
+agent.py - IFS Cloud ERP Agent following learn-claude-code v3 pattern
+
+Core Philosophy: "The model is 80%. Code is 20%."
+The model controls the loop - we just provide tools and stay out of the way.
+
+Core loop:
+    while True:
+        response = model(messages, tools)
+        if response.stop_reason != "tool_use":
+            return response.text
+        results = execute(response.tool_calls)
+        messages.append(results)
+
+Usage:
+    agent = Agent.from_config("config/base_config.yaml")
+    result = agent.run("What inventory do we have?")
+"""
+
+import json
+import os
+import sys
+from pathlib import Path
+from typing import Optional
+
+# Add parent to path for imports
+sys.path.insert(0, str(Path(__file__).parent))
+
+from prompt_loader import PromptLoader
+from llm_client import get_client, LLMClient
+
+# Import MCP tools if available
+try:
+    from tools.mcp_client import MCPToolCaller
+    from tools.mcp_tool_registry import MCPToolRetriever, get_tool_catalog, search_tools_by_keywords
+    HAS_MCP = True
+except ImportError:
+    HAS_MCP = False
+    MCPToolCaller = None
+    MCPToolRetriever = None
+    get_tool_catalog = None
+    search_tools_by_keywords = None
+
+# Knowledge base path (for procedural rules)
+KNOWLEDGE_PATH = Path(__file__).parent.parent / "config" / "ifs_knowledge.yaml"
+
+
+# =============================================================================
+# Agent Configuration - Maps to ifs-prompts/ files
+# =============================================================================
+
+AGENT_TYPES = {
+    "Explore": {
+        "system": "agent-prompt-explore-ifs.md",
+        "tools": ["MCPSearch"],  # Read-only
+    },
+    "Plan": {
+        "system": "agent-prompt-plan-mode-enhanced-ifs.md",
+        "reminder": "system-reminder-plan-mode-is-active-ifs.md",
+        "tools": ["MCPSearch", "TodoWrite", "AskUserQuestion"],
+    },
+    "general-purpose": {
+        "system": "system-prompt-main-system-prompt-ifs.md",
+        "tools": "*",  # All tools
+    },
+    "summarizer": {
+        "system": "agent-prompt-conversation-summarization.md",
+        "tools": [],  # No tools
+    },
+}
+
+# Tool definitions from ifs-prompts/
+ORCHESTRATION_TOOLS = {
+    "MCPSearch": {
+        "prompt": "tool-description-mcpsearch-ifs.md",  # IFS version with workflow knowledge
+        "schema": {
+            "type": "object",
+            "properties": {
+                "query": {
+                    "type": "string",
+                    "description": "Search query or 'select:<tool_name>' to load a specific tool"
+                }
+            },
+            "required": ["query"],
+        },
+    },
+    "Task": {
+        "prompt": "tool-description-task.md",
+        "schema": {
+            "type": "object",
+            "properties": {
+                "prompt": {"type": "string", "description": "Task for subagent"},
+                "subagent_type": {"type": "string", "enum": ["Explore", "Plan", "general-purpose"]},
+            },
+            "required": ["prompt", "subagent_type"],
+        },
+    },
+    "TodoWrite": {
+        "prompt": "tool-description-todowrite.md",
+        "schema": {
+            "type": "object",
+            "properties": {
+                "todos": {
+                    "type": "array",
+                    "items": {
+                        "type": "object",
+                        "properties": {
+                            "content": {"type": "string"},
+                            "status": {"type": "string", "enum": ["pending", "in_progress", "completed"]},
+                        },
+                    },
+                }
+            },
+            "required": ["todos"],
+        },
+    },
+    "AskUserQuestion": {
+        "prompt": "tool-description-askuserquestion.md",
+        "schema": {
+            "type": "object",
+            "properties": {
+                "question": {"type": "string", "description": "Question to ask the user"},
+            },
+            "required": ["question"],
+        },
+    },
+}
+
+# Security policy appended to all agents
+SECURITY_PROMPT = "system-prompt-censoring-assistance-with-malicious-activities.md"
+
+
+# =============================================================================
+# TodoManager - From v2_todo_agent.py pattern
+# =============================================================================
+
+class TodoManager:
+    """Track tasks during agent execution."""
+
+    def __init__(self):
+        self.items = []
+
+    def update(self, todos: list) -> str:
+        """Update todo list."""
+        self.items = todos
+        completed = sum(1 for t in todos if t.get("status") == "completed")
+        in_progress = sum(1 for t in todos if t.get("status") == "in_progress")
+        pending = sum(1 for t in todos if t.get("status") == "pending")
+        return f"Updated: {len(todos)} todos ({completed} done, {in_progress} in progress, {pending} pending)"
+
+    def get_summary(self) -> str:
+        """Get todo summary."""
+        if not self.items:
+            return "No todos."
+        lines = []
+        for t in self.items:
+            status = t.get("status", "pending")
+            marker = {"completed": "[x]", "in_progress": "[>]", "pending": "[ ]"}.get(status, "[ ]")
+            lines.append(f"{marker} {t.get('content', '')}")
+        return "\n".join(lines)
+
+
+# =============================================================================
+# Context Management - Compaction and system reminders
+# =============================================================================
+
+MAX_CONTEXT_TOKENS = 100000  # Claude's context window
+COMPACT_THRESHOLD = 0.75     # Trigger compaction at 75%
+REMINDER_THRESHOLD = 0.50    # Start injecting reminders at 50%
+
+
+def estimate_tokens(messages: list) -> int:
+    """Rough token estimate: ~4 chars per token."""
+    return sum(len(str(m)) for m in messages) // 4
+
+
+# =============================================================================
+# Knowledge Injection - Load procedural rules from ifs_knowledge.yaml
+# =============================================================================
+
+_knowledge_cache: dict = {}
+
+
+def load_knowledge() -> dict:
+    """Load IFS knowledge base (cached)."""
+    global _knowledge_cache
+    if _knowledge_cache:
+        return _knowledge_cache
+
+    if KNOWLEDGE_PATH.exists():
+        import yaml
+        with open(KNOWLEDGE_PATH) as f:
+            _knowledge_cache = yaml.safe_load(f) or {}
+    return _knowledge_cache
+
+
+def get_tool_knowledge(tool_name: str) -> str:
+    """Get procedural knowledge for a tool (rules, common errors)."""
+    knowledge = load_knowledge()
+    parts = []
+
+    # Check procedural rules
+    procedural = knowledge.get("procedural", {})
+    if tool_name in procedural:
+        rules = procedural[tool_name].get("rules", [])
+        if rules:
+            parts.append("**Rules:**")
+            for rule in rules:
+                parts.append(f"- {rule}")
+
+    # Check common errors related to this tool
+    errors = knowledge.get("common_errors", [])
+    for err in errors:
+        keywords = err.get("keywords", [])
+        if any(kw in tool_name.lower() for kw in keywords):
+            parts.append(f"**Avoid:** {err.get('pattern', '')} → {err.get('correction', '')}")
+
+    return "\n".join(parts) if parts else ""
+
+
+# =============================================================================
+# Agent - Core implementation following v3_subagent.py pattern
+# =============================================================================
+
+class Agent:
+    """IFS Cloud ERP Agent with subagent support."""
+
+    def __init__(
+        self,
+        prompt_loader: PromptLoader,
+        llm: LLMClient,
+        mcp: Optional["MCPToolCaller"] = None,
+        workdir: Optional[str] = None,
+    ):
+        self.prompt_loader = prompt_loader
+        self.llm = llm
+        self.mcp = mcp
+        self.workdir = Path(workdir or os.getcwd())
+        self.todo = TodoManager()
+        self._discovered_tools = []
+        self._suppress_mcp_search = False  # Suppress MCPSearch after tool load (o3 fix)
+        self._pending_tool = None  # Track which tool needs to be called to lift suppression
+        # Check if using Anthropic (affects message format)
+        self._is_anthropic = type(llm).__name__ == "AnthropicClient"
+
+        # MCP tool registry for semantic search
+        self.retriever = None
+        if HAS_MCP and MCPToolRetriever:
+            try:
+                self.retriever = MCPToolRetriever.get_instance()
+            except Exception:
+                pass
+
+    def _build_system_prompt(self, agent_type: str) -> str:
+        """Compose system prompt from multiple ifs-prompts/ files."""
+        config = AGENT_TYPES.get(agent_type, AGENT_TYPES["general-purpose"])
+        parts = []
+
+        # 1. Load base system prompt
+        try:
+            parts.append(self.prompt_loader.load(config["system"]))
+        except FileNotFoundError:
+            parts.append(f"You are an IFS Cloud ERP assistant ({agent_type} mode).")
+
+        # 2. Add security policy
+        try:
+            parts.append(self.prompt_loader.load(SECURITY_PROMPT))
+        except FileNotFoundError:
+            pass
+
+        # 3. Add contextual reminder if present
+        if "reminder" in config:
+            try:
+                parts.append(self.prompt_loader.load(config["reminder"]))
+            except FileNotFoundError:
+                pass
+
+        # 4. Tool catalog REMOVED - model discovers tools via MCPSearch
+        # This saves ~1,475 tokens per request
+        # The model will use MCPSearch to find and load tools as needed
+
+        # 5. Add workdir context
+        parts.append(f"\nWorking directory: {self.workdir}")
+
+        return "\n\n".join(parts)
+
+    def _build_tools(self, tool_names: list) -> list:
+        """Build tools array from ifs-prompts/ tool descriptions."""
+        if tool_names == "*":
+            tool_names = list(ORCHESTRATION_TOOLS.keys())
+
+        tools = []
+        for name in tool_names:
+            if name not in ORCHESTRATION_TOOLS:
+                continue
+
+            config = ORCHESTRATION_TOOLS[name]
+
+            # Load description from prompt file
+            try:
+                description = self.prompt_loader.load(config["prompt"])
+            except FileNotFoundError:
+                description = f"Tool: {name}"
+
+            tools.append({
+                "name": name,
+                "description": description[:1000],  # Truncate long descriptions
+                "input_schema": config["schema"],
+            })
+
+        return tools
+
+    def run(self, user_message: str, agent_type: str = "general-purpose") -> str:
+        """
+        Run agent loop until completion.
+
+        This is THE core pattern from learn-claude-code:
+            while True:
+                response = model(messages, tools)
+                if response.stop_reason != "tool_use":
+                    return response.text
+                results = execute(response.tool_calls)
+                messages.append(results)
+        """
+        config = AGENT_TYPES.get(agent_type, AGENT_TYPES["general-purpose"])
+        system = self._build_system_prompt(agent_type)
+        messages = [{"role": "user", "content": user_message}]
+
+        # Build tools
+        base_tools = self._build_tools(config.get("tools", []))
+        max_turns = 50  # Safety limit
+
+        for turn in range(max_turns):
+            # Combine base tools with dynamically discovered MCP tools
+            all_tools = base_tools + self._discovered_tools
+
+            # Filter out MCPSearch if suppressed (forces o3 to use loaded tool)
+            if self._suppress_mcp_search:
+                all_tools = [t for t in all_tools if t.get("name") != "MCPSearch"]
+
+            # Call LLM
+            response = self.llm.chat(system, messages, all_tools)
+
+            # Check if done
+            if response["stop_reason"] != "tool_use":
+                self._suppress_mcp_search = False  # Reset on completion
+                self._pending_tool = None
+                return response.get("text", "")
+
+            # Execute tool calls
+            tool_calls = response.get("tool_calls", [])
+            if not tool_calls:
+                return response.get("text", "")
+
+            results = []
+            for tc in tool_calls:
+                output = self._execute_tool(tc)
+                # Inject system reminder if context is getting long
+                output = self._maybe_inject_reminder(output, messages)
+                results.append({
+                    "type": "tool_result",
+                    "tool_use_id": tc["id"],
+                    "content": output,
+                })
+
+            # Append to conversation
+            # For Anthropic: content already contains tool_use blocks
+            # For OpenAI: need separate tool_calls field
+            assistant_msg = {"role": "assistant", "content": response["content"]}
+            if tool_calls and not self._is_anthropic:
+                assistant_msg["tool_calls"] = tool_calls
+            messages.append(assistant_msg)
+            messages.append({"role": "user", "content": results})
+
+            # Check if we need to compact the conversation
+            if self._should_compact(messages):
+                messages = self._compact_messages(messages)
+
+        return "Max turns reached."
+
+    def run_streaming(self, user_message: str, agent_type: str = "general-purpose", conversation_history: list = None):
+        """
+        Run agent loop, yielding events for streaming UI.
+
+        Args:
+            user_message: The user's input
+            agent_type: Type of agent to use
+            conversation_history: Optional list of previous messages for continuity
+
+        Yields events like:
+            {"type": "thinking", "step": 1}
+            {"type": "tool_call", "name": "...", "arguments": {...}}
+            {"type": "tool_result", "name": "...", "result": "...", "success": True}
+            {"type": "todo_update", "todos": [...]}
+            {"type": "response", "content": "..."}
+            {"type": "done"}
+        """
+        config = AGENT_TYPES.get(agent_type, AGENT_TYPES["general-purpose"])
+        system = self._build_system_prompt(agent_type)
+
+        # Start with conversation history if provided, then add new user message
+        messages = list(conversation_history) if conversation_history else []
+        messages.append({"role": "user", "content": user_message})
+
+        # Build tools
+        base_tools = self._build_tools(config.get("tools", []))
+        max_turns = 50  # Safety limit
+
+        for turn in range(max_turns):
+            yield {"type": "thinking", "step": turn + 1, "status": "Reasoning..."}
+
+            # Combine base tools with dynamically discovered MCP tools
+            all_tools = base_tools + self._discovered_tools
+
+            # Filter out MCPSearch if suppressed (forces o3 to use loaded tool)
+            if self._suppress_mcp_search:
+                all_tools = [t for t in all_tools if t.get("name") != "MCPSearch"]
+
+            # Call LLM
+            response = self.llm.chat(system, messages, all_tools)
+
+            # Check if done
+            if response["stop_reason"] != "tool_use":
+                self._suppress_mcp_search = False  # Reset on completion
+                self._pending_tool = None
+                text = response.get("text", "")
+                if text:
+                    yield {"type": "response", "content": text}
+                yield {"type": "done"}
+                return
+
+            # Execute tool calls
+            tool_calls = response.get("tool_calls", [])
+            if not tool_calls:
+                text = response.get("text", "")
+                if text:
+                    yield {"type": "response", "content": text}
+                yield {"type": "done"}
+                return
+
+            results = []
+            for tc in tool_calls:
+                name = tc["name"]
+                args = tc.get("arguments", {})
+
+                # Emit tool call event
+                yield {"type": "tool_call", "name": name, "arguments": args, "step": turn + 1}
+
+                # Execute tool
+                output = self._execute_tool_streaming(tc)
+
+                # Emit todo update if TodoWrite was called
+                if name == "TodoWrite":
+                    yield {"type": "todo_update", "todos": self.todo.items}
+
+                # Emit tool result
+                success = not output.startswith("Error:")
+                yield {"type": "tool_result", "name": name, "result": output, "success": success}
+
+                # Inject system reminder if context is getting long
+                output = self._maybe_inject_reminder(output, messages)
+                results.append({
+                    "type": "tool_result",
+                    "tool_use_id": tc["id"],
+                    "content": output,
+                })
+
+            # Append to conversation
+            # For Anthropic: content already contains tool_use blocks
+            # For OpenAI: need separate tool_calls field
+            assistant_msg = {"role": "assistant", "content": response["content"]}
+            if tool_calls and not self._is_anthropic:
+                assistant_msg["tool_calls"] = tool_calls
+            messages.append(assistant_msg)
+            messages.append({"role": "user", "content": results})
+
+            # Check if we need to compact the conversation
+            if self._should_compact(messages):
+                messages = self._compact_messages(messages)
+
+        yield {"type": "warning", "message": "Max turns reached"}
+        yield {"type": "done"}
+
+    def _execute_tool_streaming(self, tc: dict) -> str:
+        """Execute a tool call for streaming (no print statements)."""
+        name = tc["name"]
+        args = tc.get("arguments", {})
+
+        # Reset MCPSearch suppression only when the pending loaded tool is called (o3 fix)
+        if self._pending_tool and name == self._pending_tool:
+            self._suppress_mcp_search = False
+            self._pending_tool = None
+
+        try:
+            if name == "MCPSearch":
+                result = self._handle_mcp_search(args.get("query", ""))
+            elif name == "TodoWrite":
+                result = self.todo.update(args.get("todos", []))
+            elif name == "Task":
+                result = self._spawn_subagent(args)
+            elif name == "AskUserQuestion":
+                # In streaming mode, we can't block for user input
+                # Return the question so UI can handle it
+                result = f"QUESTION: {args.get('question', '')}"
+            elif self.mcp:
+                # Route to MCP (async call)
+                import asyncio
+                loop = asyncio.new_event_loop()
+                asyncio.set_event_loop(loop)
+                try:
+                    result = loop.run_until_complete(
+                        self.mcp.call_tool({"function": {"name": name, "arguments": args}})
+                    )
+                finally:
+                    loop.close()
+                # Convert result to string if needed
+                if isinstance(result, dict):
+                    result = json.dumps(result, indent=2)
+            else:
+                result = f"Unknown tool: {name}"
+        except Exception as e:
+            result = f"Error: {e}"
+
+        return result
+
+    def _execute_tool(self, tc: dict) -> str:
+        """Execute a tool call and return result."""
+        name = tc["name"]
+        args = tc.get("arguments", {})
+
+        # Reset MCPSearch suppression only when the pending loaded tool is called (o3 fix)
+        if self._pending_tool and name == self._pending_tool:
+            self._suppress_mcp_search = False
+            self._pending_tool = None
+
+        print(f"\n> {name}: {args}")
+
+        try:
+            if name == "MCPSearch":
+                result = self._handle_mcp_search(args.get("query", ""))
+            elif name == "TodoWrite":
+                result = self.todo.update(args.get("todos", []))
+            elif name == "Task":
+                result = self._spawn_subagent(args)
+            elif name == "AskUserQuestion":
+                result = self._ask_user(args.get("question", ""))
+            elif self.mcp:
+                # Route to MCP (async call)
+                import asyncio
+                result = asyncio.get_event_loop().run_until_complete(
+                    self.mcp.call_tool({"function": {"name": name, "arguments": args}})
+                )
+                # Convert result to string if needed
+                if isinstance(result, dict):
+                    result = json.dumps(result, indent=2)
+            else:
+                result = f"Unknown tool: {name}"
+        except Exception as e:
+            result = f"Error: {e}"
+
+        # Preview result
+        preview = result[:200] + "..." if len(result) > 200 else result
+        print(f"  {preview}")
+
+        return result
+
+    def _handle_mcp_search(self, query: str) -> str:
+        """MCPSearch: discover and load tools with knowledge injection."""
+        # Select specific tool: "select:tool_name"
+        if query.startswith("select:"):
+            tool_name = query[7:].strip()
+            return self._load_tool_with_knowledge(tool_name)
+
+        # Keyword search (uses search_tools_by_keywords from registry)
+        if search_tools_by_keywords:
+            tools = search_tools_by_keywords(query, top_k=5)
+            if tools:
+                lines = ["**Found tools:**"]
+                for t in tools:
+                    flag = "!" if t.mutates else ""
+                    lines.append(f"- {t.name}{flag}: {t.summary}")
+                lines.append("\nUse `select:<tool_name>` to load a tool's schema.")
+                return "\n".join(lines)
+
+        # Fallback to retriever if available
+        if self.retriever:
+            tool_names = self.retriever.retrieve(query, top_k=5)
+            if tool_names:
+                return f"Found tools: {', '.join(tool_names)}. Use `select:<name>` to load."
+
+        return "No tools found matching query."
+
+    def _load_tool_with_knowledge(self, tool_name: str) -> str:
+        """Load tool schema and inject procedural knowledge."""
+        loaded = False
+        parts = []
+
+        # Check if already loaded (prevents duplicate tool error)
+        already_loaded = any(t.get("name") == tool_name for t in self._discovered_tools)
+        if already_loaded:
+            # Tool already available - just return confirmation
+            knowledge = get_tool_knowledge(tool_name)
+            if knowledge:
+                return f"{tool_name} is already loaded and available. Call it directly.\n\n**Rules:**\n{knowledge}"
+            return f"{tool_name} is already loaded and available. Call it directly."
+
+        # Get schema from MCP if available
+        if self.mcp:
+            schema = self.mcp.get_tool_schema(tool_name)
+            if schema and "error" not in str(schema):
+                # Clean schema for Anthropic (remove extra fields like 'server')
+                clean_schema = {
+                    "name": schema["name"],
+                    "description": schema.get("description", ""),
+                    "input_schema": schema.get("input_schema", {"type": "object", "properties": {}})
+                }
+                self._discovered_tools.append(clean_schema)
+                loaded = True
+                # Suppress MCPSearch until this specific tool is called (o3 fix)
+                self._suppress_mcp_search = True
+                self._pending_tool = tool_name
+                # Add parameter info
+                params = schema.get("input_schema", {}).get("properties", {})
+                if params:
+                    parts.append("**Parameters:**")
+                    for name, info in params.items():
+                        desc = info.get("description", "")
+                        parts.append(f"- {name}: {desc}")
+
+        # Inject procedural knowledge from ifs_knowledge.yaml
+        knowledge = get_tool_knowledge(tool_name)
+        if knowledge:
+            parts.append(f"\n**Rules:**\n{knowledge}")
+
+        # Only say "LOADED" if we actually loaded the tool schema
+        if not loaded:
+            if knowledge:
+                # We have knowledge but no MCP connection - tool can't be called
+                return f"Tool {tool_name} exists but MCP is not connected. Cannot load tool schema."
+            return f"Tool not found: {tool_name}"
+
+        # Clear message: tool is ready to call NOW
+        header = f"LOADED: {tool_name} is now available. Call it directly - do not search again."
+        return header + ("\n\n" + "\n".join(parts) if parts else "")
+
+    def _spawn_subagent(self, args: dict) -> str:
+        """Task tool: spawn isolated subagent (v3 pattern)."""
+        prompt = args.get("prompt", "")
+        subagent_type = args.get("subagent_type", "general-purpose")
+
+        print(f"\n[Spawning {subagent_type} subagent]")
+
+        # Create fresh agent with isolated context
+        subagent = Agent(
+            prompt_loader=self.prompt_loader,
+            llm=self.llm,
+            mcp=self.mcp,
+            workdir=str(self.workdir),
+        )
+
+        return subagent.run(prompt, subagent_type)
+
+    def _ask_user(self, question: str) -> str:
+        """Ask user for input."""
+        print(f"\n? {question}")
+        try:
+            response = input("> ").strip()
+            return response or "(no response)"
+        except (EOFError, KeyboardInterrupt):
+            return "(cancelled)"
+
+    # =========================================================================
+    # Context Management
+    # =========================================================================
+
+    def _should_compact(self, messages: list) -> bool:
+        """Check if conversation needs compaction."""
+        tokens = estimate_tokens(messages)
+        return tokens > MAX_CONTEXT_TOKENS * COMPACT_THRESHOLD
+
+    def _compact_messages(self, messages: list) -> list:
+        """Summarize conversation using summarizer subagent."""
+        print("\n[Context compaction triggered]")
+
+        # Build conversation text for summarization
+        conv_text = "\n".join(str(m) for m in messages[:-1])  # Exclude last message
+
+        summary = self._spawn_subagent({
+            "prompt": conv_text,
+            "subagent_type": "summarizer"
+        })
+
+        # Return compacted messages: summary + last user message
+        last_msg = messages[-1] if messages else {"role": "user", "content": ""}
+        return [
+            {"role": "user", "content": f"<summary>\n{summary}\n</summary>"},
+            last_msg
+        ]
+
+    def _maybe_inject_reminder(self, tool_result: str, messages: list) -> str:
+        """Inject system reminders if context is getting long."""
+        tokens = estimate_tokens(messages)
+
+        if tokens < MAX_CONTEXT_TOKENS * REMINDER_THRESHOLD:
+            return tool_result
+
+        reminders = []
+
+        # Todo reminder if items exist
+        if self.todo.items:
+            in_progress = [t for t in self.todo.items if t.get("status") == "in_progress"]
+            if in_progress:
+                reminders.append(f"Current task: {in_progress[0].get('content', '')}")
+
+        # Context warning
+        pct = int(tokens / MAX_CONTEXT_TOKENS * 100)
+        if pct > 60:
+            reminders.append(f"Context usage: {pct}%. Consider completing current task.")
+
+        if reminders:
+            reminder_text = "\n".join(reminders)
+            return f"{tool_result}\n\n<system-reminder>\n{reminder_text}\n</system-reminder>"
+
+        return tool_result
+
+    @classmethod
+    def from_config(cls, config_path: str) -> "Agent":
+        """Create agent from config file."""
+        import yaml
+
+        config_path = Path(config_path)
+        with open(config_path) as f:
+            config = yaml.safe_load(f)
+
+        # Resolve paths relative to config
+        prompts_dir = config.get("prompts_dir", "../ifs-prompts")
+        if not Path(prompts_dir).is_absolute():
+            prompts_dir = config_path.parent / prompts_dir
+
+        # Load variables
+        variables = config.get("variables", {})
+        vars_file = config.get("prompt_variables_file")
+        if vars_file:
+            vars_path = config_path.parent / vars_file
+            if vars_path.exists():
+                with open(vars_path) as f:
+                    variables.update(yaml.safe_load(f) or {})
+
+        prompt_loader = PromptLoader(str(prompts_dir), variables)
+
+        # Get LLM client
+        provider = config.get("llm_provider", os.getenv("LLM_PROVIDER", "anthropic"))
+        model = config.get(f"{provider}_model")
+        llm = get_client(provider, model=model) if model else get_client(provider)
+
+        # MCP client if available
+        mcp = None
+        if HAS_MCP and MCPToolCaller:
+            planning_url = config.get("mcp_planning_url", "http://localhost:8000/sse")
+            customer_url = config.get("mcp_customer_url", "http://localhost:8001/sse")
+            try:
+                mcp = MCPToolCaller(planning_url=planning_url, customer_url=customer_url)
+                # Initialize synchronously (load tools from servers)
+                # Create new event loop for this thread (works in main thread or Flask)
+                import asyncio
+                try:
+                    loop = asyncio.get_event_loop()
+                except RuntimeError:
+                    loop = asyncio.new_event_loop()
+                    asyncio.set_event_loop(loop)
+                loop.run_until_complete(mcp.initialize())
+                print(f"MCP: Connected to {len(mcp._tools)} tools")
+            except Exception as e:
+                print(f"MCP: Connection failed - {e}")
+                mcp = None
+
+        return cls(
+            prompt_loader=prompt_loader,
+            llm=llm,
+            mcp=mcp,
+            workdir=config.get("workdir"),
+        )
+
+
+# =============================================================================
+# Main REPL
+# =============================================================================
+
+def main():
+    """Simple Read-Eval-Print Loop."""
+    import argparse
+
+    parser = argparse.ArgumentParser(description="IFS Cloud ERP Agent")
+    parser.add_argument("--config", default="config/base_config.yaml", help="Config file")
+    parser.add_argument("--prompt", help="Single prompt (non-interactive)")
+    parser.add_argument("--agent-type", default="general-purpose", help="Agent type")
+    args = parser.parse_args()
+
+    # Try to load from config, fall back to defaults
+    try:
+        agent = Agent.from_config(args.config)
+    except FileNotFoundError:
+        print(f"Config not found: {args.config}, using defaults")
+        prompt_loader = PromptLoader("../ifs-prompts")
+        llm = get_client()
+        agent = Agent(prompt_loader, llm)
+
+    print(f"IFS Cloud ERP Agent - {agent.workdir}")
+    print(f"LLM: {type(agent.llm).__name__}")
+    print("Type 'exit' to quit.\n")
+
+    # Single prompt mode
+    if args.prompt:
+        result = agent.run(args.prompt, args.agent_type)
+        print(result)
+        return
+
+    # Interactive REPL
+    while True:
+        try:
+            user_input = input("You: ").strip()
+        except (EOFError, KeyboardInterrupt):
+            break
+
+        if not user_input or user_input.lower() in ("exit", "quit", "q"):
+            break
+
+        try:
+            result = agent.run(user_input, args.agent_type)
+            print(f"\nAssistant: {result}\n")
+        except Exception as e:
+            print(f"Error: {e}\n")
+
+
+if __name__ == "__main__":
+    main()

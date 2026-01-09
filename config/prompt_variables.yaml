@@ -1,0 +1,28 @@
+# prompt_variables.yaml - Variable bindings for ifs-prompts/ templates
+#
+# These variables are substituted in ${VAR} placeholders when loading prompts.
+# Used by PromptLoader to resolve template expressions.
+
+# Tool names (match the actual tool implementations)
+TASK_TOOL_NAME: Task
+TODO_TOOL_OBJECT: TodoWrite
+ASKUSERQUESTION_TOOL_NAME: AskUserQuestion
+EXPLORE_AGENT: Explore
+
+# Security and access control
+SECURITY_POLICY: "Only perform read operations unless explicitly confirmed by user."
+
+# IFS-specific context
+IFS_CONTEXT: |
+  You are working with IFS Cloud ERP, an enterprise resource planning system.
+  Available data includes: inventory, work orders, customer orders, purchasing,
+  manufacturing, and financial information.
+
+# Agent behavior settings
+MAX_TOOL_CALLS_PER_TURN: 10
+DEFAULT_AGENT_TYPE: general-purpose
+
+# MCP server configuration hints
+MCP_SERVERS:
+  planning: "IFS Planning Server - inventory, capacity, scheduling"
+  customer: "IFS Customer Server - orders, customers, deliveries"

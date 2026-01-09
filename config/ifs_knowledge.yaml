@@ -1,0 +1,95 @@
+# IFS Cloud Knowledge Base for DeepAgent
+# Combined procedural rules + semantic domain facts
+# Retrieved using keyword matching (same as episodic memory)
+
+# =============================================================================
+# PROCEDURAL RULES - Tool-specific instructions (migrated from seed_memories.json)
+# =============================================================================
+
+procedural:
+  create_shipment_order:
+    keywords: [shipment, create, ship, move, transfer, transport]
+    rules:
+      # Parameters are auto-extracted from MCP schema at runtime (Part 7)
+      - "Always determine the part_no before creating a shipment order - the order is useless without lines"
+      - "The shipment_order_id returned is a NUMBER (e.g., 34), not a string like 'SO-123'"
+      - "The MCP server normalizes shorthand warehouse IDs: '205' → 'AC-A205', '110' → 'AC-A110'"
+      - "IMPORTANT: '105' or 'Warehouse 105' means the site 'AC' itself - use 'AC' as the warehouse value, NOT 'AC-A105'"
+      - "For site AC: use 'AC' for the main site (105), '205' or 'AC-A205' for remote warehouse"
+
+  add_shipment_order_line:
+    keywords: [shipment, line, add, part, item, qty]
+    rules:
+      # Parameters are auto-extracted from MCP schema at runtime (Part 7)
+      - "Use the EXACT shipment_order_id number from create_shipment_order response"
+      - "Pass shipment_order_id as an INTEGER, not a string"
+      - "Quantity parameter is 'qty_to_ship' (not 'quantity' or 'qty')"
+      - "Required params: shipment_order_id, part_no, qty_to_ship"
+
+  release_shipment_order:
+    keywords: [shipment, release, approve, finalize]
+    rules:
+      - "Only release after successfully adding at least one line"
+      - "Use the same integer shipment_order_id from the create response"
+
+  get_inventory_stock:
+    keywords: [inventory, stock, onhand, available, qty, quantity, level]
+    rules:
+      - "Use part_no (not part or part_number)"
+      - "Site parameter is 'site' (e.g., 'AC')"
+      - "Returns all warehouses at the site - don't specify warehouse here"
+
+# =============================================================================
+# SEMANTIC FACTS - Domain knowledge about IFS Cloud
+# =============================================================================
+
+semantic:
+  intent_mapping:
+    keywords: [move, transfer, ship, reserve, allocate, hold, stock, onhand]
+    facts:
+      - "When user says 'move', 'transfer', or 'ship' → use Shipment Workflow (create_shipment_order + add_shipment_order_line + release_shipment_order)"
+      - "When user says 'reserve', 'allocate', or 'hold' → use Reservation Workflow (plan_reservation + execute_reservation)"
+      - "When user says 'check stock', 'inventory', or 'onhand' → use get_inventory_stock"
+      - "When user says 'place order' or 'new order' → use Order Workflow (create_order + add_order_line)"
+
+  sites:
+    keywords: [site, sites, contract, location, warehouse, warehouses, "105", "110", "205"]
+    facts:
+      - "Site AC has remote warehouses: AC-A110, AC-A205"
+      - "'105' or 'Warehouse 105' means site AC itself - use 'AC' as the warehouse value, NOT 'AC-A105'"
+      - "Default site is 'AC' unless user specifies otherwise"
+      - "Shorthand: '205' → 'AC-A205', '110' → 'AC-A110', '105' → 'AC' (site itself)"
+
+  shipments:
+    keywords: [shipment, ship, move, transfer, transport]
+    facts:
+      - "Shipment orders require 3 steps: create_shipment_order -> add_shipment_order_line -> release_shipment_order"
+      - "create_shipment_order uses from_warehouse and to_warehouse parameters"
+      - "shipment_order_id is always an INTEGER (e.g., 34), never a string like 'SO-34'"
+      - "MCP server normalizes: '205' → 'AC-A205', '110' → 'AC-A110', but '105' → use 'AC' directly"
+
+  inventory:
+    keywords: [inventory, stock, qty, quantity, onhand, available, reserve]
+    facts:
+      - "Use get_inventory_stock to check ALL warehouses at a site"
+      - "Use search_inventory_by_warehouse for ONE specific warehouse only"
+      - "Parameter is 'part_no' (not 'part' or 'part_number')"
+
+  orders:
+    keywords: [order, customer, sales, line]
+    facts:
+      - "Order numbers with asterisks like '*1063' should include the asterisk"
+      - "Parameter is 'order_no' (not 'order_number' or 'orderNo')"
+
+# =============================================================================
+# COMMON ERRORS - Error patterns to avoid (migrated from seed_memories.json)
+# =============================================================================
+
+common_errors:
+  - pattern: "shipment_order_id as string"
+    keywords: [shipment, order, id, string]
+    correction: "Use integer from create_shipment_order response (e.g., 34 not '34' or 'SO-34')"
+
+  - pattern: "missing part_no for shipment"
+    keywords: [shipment, part, missing]
+    correction: "Ask user which part to move before creating shipment order"
