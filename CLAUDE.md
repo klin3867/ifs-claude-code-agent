@@ -5,14 +5,14 @@
 **"The model is 80%. Code is 20%."**
 
 This means:
-- **Prompts are the product** - They live in `../ifs-prompts/`
+- **Prompts are the product** - They live in `ifs-prompts/`
 - **Code just loads and executes** - It should be minimal and boring
 - **Never hardcode prompts in Python** - Always load from markdown files
 
 ### Before Making Changes, Ask:
 
 1. **Is this a prompt change or a code change?**
-   - Prompt changes → Edit files in `../ifs-prompts/`
+   - Prompt changes → Edit files in `ifs-prompts/`
    - Code changes → Only if the model literally cannot do something
 
 2. **Am I duplicating prompt content in code?**
@@ -26,7 +26,7 @@ This means:
 ## Architecture
 
 ```
-ifs-cloud-erp-agent/
+ifs-claude-code-agent/
 ├── src/
 │   ├── app_flask.py        # Web UI - loads prompts, streams responses
 │   ├── agent.py            # CLI agent - loads prompts, runs loop
@@ -37,15 +37,15 @@ ifs-cloud-erp-agent/
 │       └── mcp_tool_registry.py # Tool catalog with keyword search
 ├── config/
 │   ├── base_config.yaml        # API keys, MCP URLs
-│   └── ifs_knowledge.yaml      # Procedural rules (injected at tool load)
+│   ├── ifs_knowledge.yaml      # Procedural rules (injected at tool load)
+│   └── prompt_variables.yaml   # Template variable bindings
+├── ifs-prompts/                # THE MAIN PRODUCT
+│   ├── system-prompt-main-system-prompt-ifs.md    # Core agent behavior
+│   ├── agent-prompt-explore-ifs.md                # Explore subagent
+│   ├── agent-prompt-plan-mode-enhanced-ifs.md     # Plan subagent
+│   ├── tool-description-*.md                      # Tool descriptions
+│   └── ...
 └── LEGACY/                     # Old code for reference only
-
-../ifs-prompts/                 # THE MAIN PRODUCT
-├── system-prompt-main-system-prompt-ifs.md    # Core agent behavior
-├── agent-prompt-explore-ifs.md                # Explore subagent
-├── agent-prompt-plan-mode-enhanced-ifs.md     # Plan subagent
-├── tool-description-*.md                      # Tool descriptions
-└── ...
 ```
 
 ## How Prompts Are Loaded
@@ -106,9 +106,11 @@ parts.append("""You are an IFS Cloud ERP assistant...
 
 ## Running
 
+See [README.md](README.md) for full setup instructions.
+
 ```bash
 # Web UI
-cd src && python app_flask.py
+cd src && python app_flask.py --port 5002
 
 # CLI
 cd src && python agent.py --config ../config/base_config.yaml
@@ -116,10 +118,9 @@ cd src && python agent.py --config ../config/base_config.yaml
 
 ## Environment
 
-```bash
-# Required
-ANTHROPIC_API_KEY=sk-ant-...
+Create a `.env` file in the project root:
 
-# Optional (for OpenAI models)
-OPENAI_API_KEY=sk-...
+```bash
+ANTHROPIC_API_KEY=sk-ant-your-key-here
+OPENAI_API_KEY=lm-studio  # or real key if using OpenAI
 ```
