@@ -39,6 +39,16 @@ procedural:
       - "Site parameter is 'site' (e.g., 'AC')"
       - "Returns all warehouses at the site - don't specify warehouse here"
 
+  analyze_unreserved_demand_by_warehouse:
+    keywords: [order, demand, fulfillment, shortage, unreserved, warehouse, cascade, review]
+    rules:
+      - "Primary tool for 'review orders and check inventory' queries"
+      - "Returns compact sourcing plan - don't fetch raw orders separately"
+      - "Set auto_create_shipments=true AND target_warehouse to create shipment orders"
+      - "target_warehouse is the DESTINATION - where inventory should END UP"
+      - "warehouse_priority determines search order for SOURCE warehouses"
+      - "Default priority: A205 → A110 → A105 (or use '205', '110', '105')"
+
 # =============================================================================
 # SEMANTIC FACTS - Domain knowledge about IFS Cloud
 # =============================================================================
