@@ -123,3 +123,85 @@ ANTHROPIC_API_KEY=sk-ant-...
 # Optional (for OpenAI models)
 OPENAI_API_KEY=sk-...
 ```
+
+## Tool Discovery (MCPSearch Pattern)
+
+The agent uses **lazy-load tool schemas** for token efficiency:
+
+1. **59 MCP tools** available across two servers (planning + customer)
+2. Agent sees **summaries** (~20 tokens each), not full schemas
+3. Uses `MCPSearch` meta-tool to find relevant tools by keyword
+4. Loads full schema **on demand** when tool is selected
+5. **Result**: 90-95% reduction in token usage vs embedding all schemas
+
+**Flow:**
+```
+User: "Check inventory for part ABC"
+    → MCPSearch(query="inventory") → Returns: get_inventory_stock, search_inventory_by_warehouse
+    → MCPSearch(query="select:get_inventory_stock") → Loads full schema
+    → Agent calls get_inventory_stock(part_no="ABC")
+```
+
+## Hybrid Model Routing
+
+Cost optimization via model-specific routing:
+
+```yaml
+# config/base_config.yaml
+model_routing:
+  smart_agents: [general-purpose, Plan]    # Claude Sonnet (complex reasoning)
+  aux_agents: [Explore, summarizer]        # Local gpt-oss-20b (fast, free)
+```
+
+| Agent Type | Model | Use Case |
+|------------|-------|----------|
+| general-purpose | Claude Sonnet | Main reasoning, tool orchestration |
+| Plan | Claude Sonnet | Complex multi-step planning |
+| Explore | Local/Haiku | Read-only tool discovery |
+| summarizer | Local/Haiku | Conversation compaction |
+
+## Key Configuration
+
+### `config/base_config.yaml`
+- `llm_provider`: `anthropic` or `openai`
+- `anthropic_model`: Model name (e.g., `claude-sonnet-4-20250514`)
+- `mcp_planning_url`: Inventory/scheduling MCP server
+- `mcp_customer_url`: Orders/customers MCP server
+
+### `config/ifs_knowledge.yaml`
+Procedural rules injected when tools are loaded:
+- Shipment workflow: 3-step process with integer IDs
+- Site abbreviations: '205' → 'AC-A205'
+- Common error corrections
+
+## Agent Types & Prompts
+
+| Agent Type | System Prompt | Description |
+|------------|--------------|-------------|
+| `general-purpose` | `system-prompt-main-system-prompt-ifs.md` | Full capabilities, all tools |
+| `Explore` | `agent-prompt-explore-ifs.md` | Read-only, tool discovery |
+| `Plan` | `agent-prompt-plan-mode-enhanced-ifs.md` | Structured planning, todos |
+| `summarizer` | `agent-prompt-conversation-summarization.md` | Compress history |
+
+## Testing
+
+```bash
+# Multi-turn conversation tests
+cd tests && python test_multiturn.py
+
+# Hybrid model comparison (Claude vs local)
+python test_hybrid_comparison.py
+```
+
+## Debugging Tips
+
+1. **Tool not found**: Check `mcp_tool_registry.py` keyword index
+2. **Wrong parameters**: Check `ifs_knowledge.yaml` procedural rules
+3. **Token overflow**: Conversation compaction triggers at 75K tokens
+4. **Streaming issues**: Check Flask SSE in `app_flask.py`
+
+## Related Files (See Also)
+
+- `IMPROVEMENTS.md` - Feature gaps and optimization opportunities
+- `SESSION.md` - Session context for continuity
+- Parent: `../CLAUDE.md` - Monorepo overview

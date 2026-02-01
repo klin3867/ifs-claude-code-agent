@@ -29,6 +29,15 @@ sys.path.insert(0, str(Path(__file__).parent))
 from prompt_loader import PromptLoader
 from llm_client import get_client, LLMClient
 
+# Import episodic memory
+try:
+    from episodic_memory import get_episodic_memory, EpisodicMemory
+    HAS_EPISODIC = True
+except ImportError:
+    HAS_EPISODIC = False
+    EpisodicMemory = None
+    get_episodic_memory = None
+
 # Import MCP tools if available
 try:
     from tools.mcp_client import MCPToolCaller
@@ -69,7 +78,7 @@ AGENT_TYPES = {
     },
 }
 
-# Tool definitions from ifs-prompts/
+# Tool definitions from ifs-prompts/ - CONDENSED versions save ~3500 tokens
 ORCHESTRATION_TOOLS = {
     "MCPSearch": {
         "prompt": "tool-description-mcpsearch-ifs.md",  # IFS version with workflow knowledge
@@ -85,7 +94,7 @@ ORCHESTRATION_TOOLS = {
         },
     },
     "Task": {
-        "prompt": "tool-description-task.md",
+        "prompt": "tool-description-task-ifs.md",  # Condensed: ~300 tokens vs ~1200
         "schema": {
             "type": "object",
             "properties": {
@@ -96,7 +105,7 @@ ORCHESTRATION_TOOLS = {
         },
     },
     "TodoWrite": {
-        "prompt": "tool-description-todowrite.md",
+        "prompt": "tool-description-todowrite-ifs.md",  # Condensed: ~150 tokens vs ~2400
         "schema": {
             "type": "object",
             "properties": {
@@ -115,7 +124,7 @@ ORCHESTRATION_TOOLS = {
         },
     },
     "AskUserQuestion": {
-        "prompt": "tool-description-askuserquestion.md",
+        "prompt": "tool-description-askuserquestion-ifs.md",  # Condensed: ~50 tokens vs ~200
         "schema": {
             "type": "object",
             "properties": {
@@ -218,6 +227,46 @@ def get_tool_knowledge(tool_name: str) -> str:
     return "\n".join(parts) if parts else ""
 
 
+def get_semantic_knowledge_summary() -> str:
+    """Get key semantic facts to inject into system prompt upfront.
+
+    This ensures the model knows intent mappings and site info BEFORE tool selection.
+    Saves tokens by not repeating these in every tool call.
+    """
+    knowledge = load_knowledge()
+    semantic = knowledge.get("semantic", {})
+
+    if not semantic:
+        return ""
+
+    parts = ["## IFS Domain Knowledge"]
+
+    # Intent mapping - critical for tool selection
+    intent = semantic.get("intent_mapping", {})
+    if intent and intent.get("facts"):
+        parts.append("\n**Intent → Workflow:**")
+        for fact in intent["facts"][:4]:  # Top 4 most important
+            parts.append(f"- {fact}")
+
+    # Sites - critical for warehouse queries
+    sites = semantic.get("sites", {})
+    if sites and sites.get("facts"):
+        parts.append("\n**Sites:**")
+        for fact in sites["facts"][:3]:  # Top 3
+            parts.append(f"- {fact}")
+
+    # Shipment workflow - common gotcha
+    shipments = semantic.get("shipments", {})
+    if shipments and shipments.get("facts"):
+        # Just the 3-step workflow fact
+        for fact in shipments["facts"]:
+            if "3 steps" in fact:
+                parts.append(f"\n**Shipments:** {fact}")
+                break
+
+    return "\n".join(parts)
+
+
 # =============================================================================
 # Agent - Core implementation following v3_subagent.py pattern
 # =============================================================================
@@ -229,11 +278,15 @@ class Agent:
         self,
         prompt_loader: PromptLoader,
         llm: LLMClient,
+        aux_llm: Optional[LLMClient] = None,
         mcp: Optional["MCPToolCaller"] = None,
         workdir: Optional[str] = None,
+        model_routing: Optional[dict] = None,
+        memory_config: Optional[dict] = None,
     ):
         self.prompt_loader = prompt_loader
         self.llm = llm
+        self.aux_llm = aux_llm or llm  # Fallback to primary if not configured
         self.mcp = mcp
         self.workdir = Path(workdir or os.getcwd())
         self.todo = TodoManager()
@@ -243,6 +296,29 @@ class Agent:
         # Check if using Anthropic (affects message format)
         self._is_anthropic = type(llm).__name__ == "AnthropicClient"
 
+        # Model routing: which agent types use aux (cheap) model
+        self.model_routing = model_routing or {
+            "smart_agents": ["general-purpose", "Plan"],
+            "aux_agents": ["Explore", "summarizer"],
+        }
+
+        # Token tracking for subagents
+        self.subagent_tokens = {"input": 0, "output": 0}
+
+        # Track tool calls for episodic memory storage
+        self._current_tool_chain = []
+        self._current_query = ""
+
+        # Episodic memory for cross-task learning
+        self.episodic_memory = None
+        if HAS_EPISODIC and get_episodic_memory and memory_config:
+            if memory_config.get("memory_enabled", False):
+                self.episodic_memory = get_episodic_memory(
+                    cache_dir=memory_config.get("memory_cache_dir", "./cache/memory"),
+                    max_memories=memory_config.get("max_episodic_memories", 100),
+                    retrieval_top_k=memory_config.get("memory_retrieval_top_k", 5),
+                )
+
         # MCP tool registry for semantic search
         self.retriever = None
         if HAS_MCP and MCPToolRetriever:
@@ -250,6 +326,12 @@ class Agent:
                 self.retriever = MCPToolRetriever.get_instance()
             except Exception:
                 pass
+
+    def _get_llm_for_agent_type(self, agent_type: str) -> LLMClient:
+        """Route to smart or aux model based on agent type."""
+        if agent_type in self.model_routing.get("aux_agents", []):
+            return self.aux_llm
+        return self.llm
 
     def _build_system_prompt(self, agent_type: str) -> str:
         """Compose system prompt from multiple ifs-prompts/ files."""
@@ -275,11 +357,25 @@ class Agent:
             except FileNotFoundError:
                 pass
 
-        # 4. Tool catalog REMOVED - model discovers tools via MCPSearch
+        # 4. Inject semantic domain knowledge UPFRONT (intent mappings, sites)
+        # This ensures model knows workflows BEFORE tool selection
+        semantic = get_semantic_knowledge_summary()
+        if semantic:
+            parts.append(semantic)
+
+        # 5. Inject relevant episodic memories (past successful tool chains)
+        if self.episodic_memory and self._current_query:
+            relevant = self.episodic_memory.retrieve(self._current_query, top_k=3)
+            if relevant:
+                memory_text = self.episodic_memory.format_for_prompt(relevant)
+                if memory_text:
+                    parts.append(memory_text)
+
+        # 6. Tool catalog REMOVED - model discovers tools via MCPSearch
         # This saves ~1,475 tokens per request
         # The model will use MCPSearch to find and load tools as needed
 
-        # 5. Add workdir context
+        # 7. Add workdir context
         parts.append(f"\nWorking directory: {self.workdir}")
 
         return "\n\n".join(parts)
@@ -322,6 +418,10 @@ class Agent:
                 results = execute(response.tool_calls)
                 messages.append(results)
         """
+        # Track for episodic memory
+        self._current_query = user_message
+        self._current_tool_chain = []
+
         config = AGENT_TYPES.get(agent_type, AGENT_TYPES["general-purpose"])
         system = self._build_system_prompt(agent_type)
         messages = [{"role": "user", "content": user_message}]
@@ -341,11 +441,27 @@ class Agent:
             # Call LLM
             response = self.llm.chat(system, messages, all_tools)
 
+            # Track token usage for subagent reporting
+            if "usage" in response:
+                self.subagent_tokens["input"] += response["usage"].get("input_tokens", 0)
+                self.subagent_tokens["output"] += response["usage"].get("output_tokens", 0)
+
             # Check if done
             if response["stop_reason"] != "tool_use":
                 self._suppress_mcp_search = False  # Reset on completion
                 self._pending_tool = None
-                return response.get("text", "")
+
+                # Store successful tool chain in episodic memory
+                result_text = response.get("text", "")
+                if self.episodic_memory and self._current_tool_chain:
+                    self.episodic_memory.store(
+                        query=self._current_query,
+                        tool_chain=self._current_tool_chain,
+                        result_summary=result_text[:200] if result_text else "Completed",
+                        success=True,
+                    )
+
+                return result_text
 
             # Execute tool calls
             tool_calls = response.get("tool_calls", [])
@@ -395,6 +511,10 @@ class Agent:
             {"type": "response", "content": "..."}
             {"type": "done"}
         """
+        # Track for episodic memory
+        self._current_query = user_message
+        self._current_tool_chain = []
+
         config = AGENT_TYPES.get(agent_type, AGENT_TYPES["general-purpose"])
         system = self._build_system_prompt(agent_type)
 
@@ -419,11 +539,29 @@ class Agent:
             # Call LLM
             response = self.llm.chat(system, messages, all_tools)
 
+            # Emit token usage if available
+            if "usage" in response:
+                yield {
+                    "type": "token_usage",
+                    "input_tokens": response["usage"].get("input_tokens", 0),
+                    "output_tokens": response["usage"].get("output_tokens", 0),
+                }
+
             # Check if done
             if response["stop_reason"] != "tool_use":
                 self._suppress_mcp_search = False  # Reset on completion
                 self._pending_tool = None
                 text = response.get("text", "")
+
+                # Store successful tool chain in episodic memory
+                if self.episodic_memory and self._current_tool_chain:
+                    self.episodic_memory.store(
+                        query=self._current_query,
+                        tool_chain=self._current_tool_chain,
+                        result_summary=text[:200] if text else "Completed",
+                        success=True,
+                    )
+
                 if text:
                     yield {"type": "response", "content": text}
                 yield {"type": "done"}
@@ -486,6 +624,10 @@ class Agent:
         name = tc["name"]
         args = tc.get("arguments", {})
 
+        # Track for episodic memory (skip internal tools)
+        if name not in ("MCPSearch", "TodoWrite", "AskUserQuestion"):
+            self._current_tool_chain.append({"name": name, "args": args})
+
         # Reset MCPSearch suppression only when the pending loaded tool is called (o3 fix)
         if self._pending_tool and name == self._pending_tool:
             self._suppress_mcp_search = False
@@ -504,15 +646,20 @@ class Agent:
                 result = f"QUESTION: {args.get('question', '')}"
             elif self.mcp:
                 # Route to MCP (async call)
+                # Use existing loop or create new one (don't close - reuse for subsequent calls)
                 import asyncio
-                loop = asyncio.new_event_loop()
-                asyncio.set_event_loop(loop)
                 try:
-                    result = loop.run_until_complete(
-                        self.mcp.call_tool({"function": {"name": name, "arguments": args}})
-                    )
-                finally:
-                    loop.close()
+                    loop = asyncio.get_event_loop()
+                    if loop.is_closed():
+                        loop = asyncio.new_event_loop()
+                        asyncio.set_event_loop(loop)
+                except RuntimeError:
+                    loop = asyncio.new_event_loop()
+                    asyncio.set_event_loop(loop)
+
+                result = loop.run_until_complete(
+                    self.mcp.call_tool({"function": {"name": name, "arguments": args}})
+                )
                 # Convert result to string if needed
                 if isinstance(result, dict):
                     result = json.dumps(result, indent=2)
@@ -527,6 +674,10 @@ class Agent:
         """Execute a tool call and return result."""
         name = tc["name"]
         args = tc.get("arguments", {})
+
+        # Track for episodic memory (skip internal tools)
+        if name not in ("MCPSearch", "TodoWrite", "AskUserQuestion"):
+            self._current_tool_chain.append({"name": name, "args": args})
 
         # Reset MCPSearch suppression only when the pending loaded tool is called (o3 fix)
         if self._pending_tool and name == self._pending_tool:
@@ -547,7 +698,16 @@ class Agent:
             elif self.mcp:
                 # Route to MCP (async call)
                 import asyncio
-                result = asyncio.get_event_loop().run_until_complete(
+                try:
+                    loop = asyncio.get_event_loop()
+                    if loop.is_closed():
+                        loop = asyncio.new_event_loop()
+                        asyncio.set_event_loop(loop)
+                except RuntimeError:
+                    loop = asyncio.new_event_loop()
+                    asyncio.set_event_loop(loop)
+
+                result = loop.run_until_complete(
                     self.mcp.call_tool({"function": {"name": name, "arguments": args}})
                 )
                 # Convert result to string if needed
@@ -566,7 +726,12 @@ class Agent:
 
     def _handle_mcp_search(self, query: str) -> str:
         """MCPSearch: discover and load tools with knowledge injection."""
-        # Select specific tool: "select:tool_name"
+        # Direct load: "load:tool_name" - skip search when tool name is known
+        if query.startswith("load:"):
+            tool_name = query[5:].strip()
+            return self._load_tool_with_knowledge(tool_name)
+
+        # Select specific tool: "select:tool_name" (alias for load:)
         if query.startswith("select:"):
             tool_name = query[7:].strip()
             return self._load_tool_with_knowledge(tool_name)
@@ -579,14 +744,14 @@ class Agent:
                 for t in tools:
                     flag = "!" if t.mutates else ""
                     lines.append(f"- {t.name}{flag}: {t.summary}")
-                lines.append("\nUse `select:<tool_name>` to load a tool's schema.")
+                lines.append("\nUse `select:<tool_name>` or `load:<tool_name>` to load a tool's schema.")
                 return "\n".join(lines)
 
         # Fallback to retriever if available
         if self.retriever:
             tool_names = self.retriever.retrieve(query, top_k=5)
             if tool_names:
-                return f"Found tools: {', '.join(tool_names)}. Use `select:<name>` to load."
+                return f"Found tools: {', '.join(tool_names)}. Use `load:<name>` to load schema."
 
         return "No tools found matching query."
 
@@ -644,21 +809,46 @@ class Agent:
         return header + ("\n\n" + "\n".join(parts) if parts else "")
 
     def _spawn_subagent(self, args: dict) -> str:
-        """Task tool: spawn isolated subagent (v3 pattern)."""
+        """Task tool: spawn isolated subagent (v3 pattern) with model routing."""
         prompt = args.get("prompt", "")
         subagent_type = args.get("subagent_type", "general-purpose")
 
-        print(f"\n[Spawning {subagent_type} subagent]")
+        # Select LLM based on agent type (smart vs aux)
+        selected_llm = self._get_llm_for_agent_type(subagent_type)
+        model_name = getattr(selected_llm, 'model', 'unknown')
+        is_aux = subagent_type in self.model_routing.get("aux_agents", [])
+        model_tier = "aux" if is_aux else "smart"
 
-        # Create fresh agent with isolated context
-        subagent = Agent(
-            prompt_loader=self.prompt_loader,
-            llm=self.llm,
-            mcp=self.mcp,
-            workdir=str(self.workdir),
-        )
+        print(f"\n[Spawning {subagent_type} subagent -> {model_tier} model ({model_name})]")
 
-        return subagent.run(prompt, subagent_type)
+        def run_with_llm(llm: LLMClient) -> str:
+            """Run subagent with given LLM."""
+            subagent = Agent(
+                prompt_loader=self.prompt_loader,
+                llm=llm,
+                aux_llm=self.aux_llm,
+                mcp=self.mcp,
+                workdir=str(self.workdir),
+                model_routing=self.model_routing,
+            )
+            result = subagent.run(prompt, subagent_type)
+            # Accumulate subagent token usage
+            self.subagent_tokens["input"] += subagent.subagent_tokens.get("input", 0)
+            self.subagent_tokens["output"] += subagent.subagent_tokens.get("output", 0)
+            return result
+
+        # Try with selected LLM, fallback to primary if aux fails
+        try:
+            return run_with_llm(selected_llm)
+        except Exception as e:
+            error_msg = str(e).lower()
+            # Check for connection errors that indicate aux model is unreachable
+            if is_aux and ("connection" in error_msg or "connect" in error_msg or
+                          "refused" in error_msg or "timeout" in error_msg):
+                print(f"\n[WARN] Aux model unavailable ({e}), falling back to primary LLM")
+                return run_with_llm(self.llm)
+            # Re-raise other errors
+            raise
 
     def _ask_user(self, question: str) -> str:
         """Ask user for input."""
@@ -748,10 +938,42 @@ class Agent:
 
         prompt_loader = PromptLoader(str(prompts_dir), variables)
 
-        # Get LLM client
+        # Get primary (smart) LLM client
         provider = config.get("llm_provider", os.getenv("LLM_PROVIDER", "anthropic"))
         model = config.get(f"{provider}_model")
-        llm = get_client(provider, model=model) if model else get_client(provider)
+        base_url = config.get(f"{provider}_base_url")
+        reasoning_effort = config.get(f"{provider}_reasoning_effort")
+        llm = get_client(provider, model=model, base_url=base_url, reasoning_effort=reasoning_effort)
+        print(f"Primary LLM: {model} ({provider})")
+
+        # Get auxiliary (cheap/local) LLM client if configured
+        aux_llm = None
+        aux_model = config.get("aux_model_name")
+        if aux_model:
+            aux_provider = config.get("aux_provider", "openai")  # Default to OpenAI-compatible
+            aux_base_url = config.get("aux_base_url")
+            aux_reasoning = config.get("aux_reasoning_effort")
+            aux_llm = get_client(
+                aux_provider,
+                model=aux_model,
+                base_url=aux_base_url,
+                reasoning_effort=aux_reasoning,
+            )
+            print(f"Aux LLM: {aux_model} ({aux_provider})")
+
+        # Model routing configuration
+        model_routing = config.get("model_routing", {
+            "smart_agents": ["general-purpose", "Plan"],
+            "aux_agents": ["Explore", "summarizer"],
+        })
+
+        # Memory system configuration
+        memory_config = {
+            "memory_enabled": config.get("memory_enabled", False),
+            "memory_cache_dir": config.get("memory_cache_dir", "./cache/memory"),
+            "max_episodic_memories": config.get("max_episodic_memories", 100),
+            "memory_retrieval_top_k": config.get("memory_retrieval_top_k", 5),
+        }
 
         # MCP client if available
         mcp = None
@@ -777,8 +999,11 @@ class Agent:
         return cls(
             prompt_loader=prompt_loader,
             llm=llm,
+            aux_llm=aux_llm,
             mcp=mcp,
             workdir=config.get("workdir"),
+            model_routing=model_routing,
+            memory_config=memory_config,
         )
 
 

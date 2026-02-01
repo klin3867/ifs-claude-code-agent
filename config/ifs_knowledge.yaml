@@ -40,14 +40,77 @@ procedural:
       - "Returns all warehouses at the site - don't specify warehouse here"
 
   analyze_unreserved_demand_by_warehouse:
-    keywords: [order, demand, fulfillment, shortage, unreserved, warehouse, cascade, review]
+    keywords: [order, orders, demand, fulfillment, shortage, unreserved, warehouse, cascade, review, shipping, ship, inventory, enough, sufficient, week, supply, transfer, move, create, refill, replenish]
     rules:
       - "Primary tool for 'review orders and check inventory' queries"
-      - "Returns compact sourcing plan - don't fetch raw orders separately"
-      - "Set auto_create_shipments=true AND target_warehouse to create shipment orders"
-      - "target_warehouse is the DESTINATION - where inventory should END UP"
-      - "warehouse_priority determines search order for SOURCE warehouses"
-      - "Default priority: A205 → A110 → A105 (or use '205', '110', '105')"
+      - "compact_response=true (default) returns ~200 tokens; false returns full ~2000+ token details"
+      - "⚠️ CRITICAL: When user says 'create shipment orders', 'refill', 'replenish', or 'supply warehouse' → USE auto_create_shipments=true"
+      - "DO NOT manually call create_shipment_order + add_shipment_order_line - the tool does it automatically!"
+      - "target_warehouse is the DESTINATION - where inventory should END UP (e.g., '205' for A205)"
+      - "warehouse_priority determines search order for SOURCE warehouses (e.g., ['110','105'] to pull from those)"
+      - "FULL EXAMPLE: analyze_unreserved_demand_by_warehouse(target_warehouse='205', warehouse_priority=['110','105'], auto_create_shipments=true, days_ahead=7)"
+      - "This ONE call analyzes demand, checks inventory, finds shortfalls, AND creates all shipment orders automatically"
+
+  # ⭐ COMPOSITE TOOLS - Use these for efficiency (fewer API calls)
+
+  create_order_with_lines:
+    keywords: [create, order, lines, multi, batch, new order, customer order, place order, multiple lines]
+    rules:
+      - "⭐ COMPOSITE: Use instead of create_order + add_order_line (xN) = saves N calls"
+      - "Pass lines as array: [{catalog_no, buy_qty_due, sale_unit_price?, discount?}]"
+      - "Creates order header + all lines atomically"
+      - "Example: create_order_with_lines(customer_no='1023', lines=[{catalog_no:'20102', buy_qty_due:100}])"
+
+  bulk_update_order_lines:
+    keywords: [update, order, lines, bulk, batch, modify, change, multiple]
+    rules:
+      - "⭐ COMPOSITE: Use instead of update_order_line (xN) = saves N-1 calls"
+      - "Pass updates as array: [{line_no, buy_qty_due?, sale_unit_price?, discount?}]"
+      - "Example: bulk_update_order_lines(order_no='*1234', updates=[{line_no:'1', buy_qty_due:200}])"
+
+  plan_and_execute_reservation:
+    keywords: [reserve, reservation, plan, execute, FEFO, shipment, allocate]
+    rules:
+      - "⭐ COMPOSITE: Use instead of plan_shipment_reservation_fefo + execute_shipment_reservation_plan = saves 1 call"
+      - "Combines FEFO planning and execution in one call"
+      - "Set auto_execute=false to get plan only"
+      - "Example: plan_and_execute_reservation(shipment_order_id='25', line_no='1', qty_needed=100)"
+
+  create_and_allocate_shipment:
+    keywords: [create, shipment, lines, transfer, move, allocate, release, multi]
+    rules:
+      - "⭐ COMPOSITE: Use instead of create_shipment + add_line (xN) + release = saves N+1 calls"
+      - "Creates shipment, adds all lines, and releases automatically"
+      - "Pass lines as array: [{part_no, qty_to_ship}]"
+      - "Example: create_and_allocate_shipment(from_warehouse='110', to_warehouse='205', lines=[{part_no:'20102', qty_to_ship:100}])"
+
+  get_part_with_availability:
+    keywords: [part, availability, stock, inventory, warehouse, check, info, level]
+    rules:
+      - "⭐ COMPOSITE: Use instead of get_part + get_inventory_stock = saves 2 calls"
+      - "Returns part info + stock by warehouse + totals in one call"
+      - "Example: get_part_with_availability(part_no='20102')"
+
+  get_demand_exceptions_summary:
+    keywords: [exception, past due, shortage, negative, demand, issues, problems, alerts]
+    rules:
+      - "⭐ COMPOSITE: Use instead of get_past_due + get_shortages + get_negative_stock = saves 2 calls"
+      - "Combines all demand exceptions in one view"
+      - "Example: get_demand_exceptions_summary(site='AC', days_ahead=7)"
+
+  check_inventory_by_warehouse:
+    keywords: [inventory, warehouse, stock, check, specific, location, level]
+    rules:
+      - "Check inventory for a specific warehouse"
+      - "Can filter by part_no and min_available"
+      - "Example: check_inventory_by_warehouse(warehouse='205', min_available=10)"
+
+  get_past_due_orders:
+    keywords: [past due, overdue, late, orders, delay, behind, backlog]
+    rules:
+      - "Get all past due order lines"
+      - "Can filter by customer_no and days_overdue"
+      - "Example: get_past_due_orders(days_overdue=7)"
 
 # =============================================================================
 # SEMANTIC FACTS - Domain knowledge about IFS Cloud

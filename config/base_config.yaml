@@ -6,7 +6,31 @@ llm_provider: anthropic
 
 # Model settings per provider
 anthropic_model: claude-sonnet-4-20250514
-openai_model: o3
+openai_model: openai/gpt-oss-20b
+
+# For local models via LM Studio / Ollama
+openai_base_url: http://127.0.0.1:1234/v1
+
+# Reasoning effort for gpt-oss models: low, medium, high
+openai_reasoning_effort: high
+
+# ---------------------------- Auxiliary (Cheap) Model ----------------------------
+# Used for Explore and Summarizer agents to reduce costs
+# Comment out aux_model_name to disable hybrid routing (all agents use primary model)
+
+aux_model_name: openai/gpt-oss-20b
+aux_provider: openai
+aux_base_url: http://127.0.0.1:1234/v1
+aux_reasoning_effort: high
+
+# Model routing: which agents use aux model
+model_routing:
+  smart_agents:
+    - general-purpose
+    - Plan
+  aux_agents:
+    - Explore
+    - summarizer
 
 # Prompts directory (relative to this config file)
 prompts_dir: ../ifs-prompts
@@ -51,11 +75,11 @@ base_url: https://api.openai.com/v1
 api_key: YOUR_OPENAI_API_KEY
 tokenizer_path: gpt-4o-mini
 
-# Auxiliary LLM
-aux_model_name: gpt-4o-mini
-aux_base_url: https://api.openai.com/v1
-aux_api_key: YOUR_OPENAI_API_KEY
-aux_tokenizer_path: gpt-4o-mini
+# Auxiliary LLM (legacy - use aux_model_name in LLM Provider Config section above)
+legacy_aux_model_name: gpt-4o-mini
+legacy_aux_base_url: https://api.openai.com/v1
+legacy_aux_api_key: YOUR_OPENAI_API_KEY
+legacy_aux_tokenizer_path: gpt-4o-mini
 
 # VQA
 vqa_model_name: gpt-4o-mini
@@ -103,8 +127,8 @@ hle_data_path: ./data/HLE/all_500.json
 hle_image_dir: ./data/HLE/images
 
 # MCP (IFS Cloud)
-mcp_planning_url: http://localhost:8001/sse
-mcp_customer_url: http://localhost:8000/sse
+mcp_planning_url: http://localhost:9001/sse
+mcp_customer_url: http://localhost:9002/sse
 
 # Cache
 tool_index_cache_dir: ./cache/tool_index

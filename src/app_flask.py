@@ -22,6 +22,35 @@ _conversation_history = []
 MAX_HISTORY_MESSAGES = 20  # Keep last 20 messages (10 turns) to prevent context bloat
 
 
+def format_error_message(error: str) -> str:
+    """Format raw API errors into user-friendly messages."""
+    error_lower = error.lower()
+
+    # Anthropic credit/billing errors
+    if "credit balance" in error_lower or "billing" in error_lower:
+        return ("API Credit Error: Your Anthropic account has insufficient credits. "
+                "Please add credits at https://console.anthropic.com/settings/billing")
+
+    # Rate limiting
+    if "rate limit" in error_lower or "too many requests" in error_lower:
+        return "Rate Limited: Too many requests. Please wait a moment and try again."
+
+    # Authentication errors
+    if "invalid api key" in error_lower or "authentication" in error_lower:
+        return "Authentication Error: Invalid API key. Please check your ANTHROPIC_API_KEY."
+
+    # Connection errors
+    if "connection" in error_lower or "timeout" in error_lower:
+        return "Connection Error: Could not reach the API. Please check your network connection."
+
+    # MCP/tool errors
+    if "mcp" in error_lower or "tool" in error_lower:
+        return f"Tool Error: {error}"
+
+    # Default: return original but with prefix
+    return f"Error: {error}"
+
+
 def get_agent() -> Agent:
     """Get or create the singleton agent instance."""
     global _agent
@@ -58,7 +87,7 @@ def process_message(user_message: str, event_queue: queue.Queue):
             _conversation_history = _conversation_history[-MAX_HISTORY_MESSAGES:]
 
     except Exception as e:
-        event_queue.put({"type": "error", "message": str(e)})
+        event_queue.put({"type": "error", "message": format_error_message(str(e))})
         event_queue.put({"type": "done"})
 
 
@@ -106,6 +135,108 @@ def clear():
     # Reset agent to clear its internal state
     _agent = None
     return {"status": "ok"}
+
+
+@app.route('/health')
+def health():
+    """Health check endpoint for evaluation framework."""
+    return {"status": "ok", "agent": "ifs-claude-code-agent"}
+
+
+@app.route('/eval', methods=['POST'])
+def eval_endpoint():
+    """
+    Evaluation endpoint that returns structured metadata.
+
+    Request: {"query": "...", "return_metadata": true}
+    Response: {
+        "response": "...",
+        "success": true/false,
+        "error": null or "error message",
+        "metadata": {
+            "duration_ms": 1234,
+            "tokens": {"input": 100, "output": 50, "total": 150},
+            "turns": 3,
+            "tool_calls": [{"name": "...", "args": {...}, "result": "..."}]
+        }
+    }
+    """
+    import time
+
+    data = request.json
+    query = data.get('query', '')
+
+    if not query.strip():
+        return {"error": "Empty query", "success": False}, 400
+
+    start_time = time.perf_counter()
+
+    # Track metrics
+    metrics = {
+        "turns": 0,
+        "tool_calls": [],
+        "tokens": {"input": 0, "output": 0, "total": 0}
+    }
+
+    final_response = ""
+    error_message = None
+
+    try:
+        agent = get_agent()
+
+        # Run agent and collect metrics from streaming events
+        for event in agent.run_streaming(query):
+            event_type = event.get("type")
+
+            if event_type == "thinking":
+                metrics["turns"] += 1
+            elif event_type == "token_usage":
+                # Accumulate token usage across all LLM calls
+                metrics["tokens"]["input"] += event.get("input_tokens", 0)
+                metrics["tokens"]["output"] += event.get("output_tokens", 0)
+                metrics["tokens"]["total"] = metrics["tokens"]["input"] + metrics["tokens"]["output"]
+            elif event_type == "tool_call":
+                metrics["tool_calls"].append({
+                    "name": event.get("name", ""),
+                    "args": event.get("arguments", {}),
+                    "result": ""  # Will be filled by tool_result event
+                })
+            elif event_type == "tool_result":
+                # Update the last tool call with its result
+                if metrics["tool_calls"]:
+                    result = event.get("result", "")
+                    # Truncate long results
+                    metrics["tool_calls"][-1]["result"] = result[:500] if len(result) > 500 else result
+            elif event_type == "response":
+                final_response += event.get("content", "")
+            elif event_type == "error":
+                error_message = event.get("message", "Unknown error")
+
+    except Exception as e:
+        error_message = str(e)
+
+    end_time = time.perf_counter()
+    duration_ms = (end_time - start_time) * 1000
+
+    # Determine success - must have actual LLM execution
+    success = (
+        error_message is None and
+        metrics["turns"] > 0 and
+        metrics["tokens"]["total"] > 0 and
+        len(final_response.strip()) > 0
+    )
+
+    return {
+        "response": final_response,
+        "success": success,
+        "error": error_message,
+        "metadata": {
+            "duration_ms": duration_ms,
+            "tokens": metrics["tokens"],
+            "turns": metrics["turns"],
+            "tool_calls": metrics["tool_calls"]
+        }
+    }
 
 
 HTML_TEMPLATE = '''
@@ -495,6 +626,107 @@ HTML_TEMPLATE = '''
             animation: pulse 1s ease-in-out infinite;
         }
 
+        /* Token Usage Footer */
+        .token-footer {
+            display: flex;
+            align-items: center;
+            gap: 0.35rem;
+            font-size: 0.75rem;
+            color: var(--text-tertiary);
+            margin-top: 0.75rem;
+            padding-top: 0.5rem;
+            border-top: 1px solid var(--border);
+            opacity: 0.7;
+        }
+        .token-icon {
+            font-size: 0.8rem;
+        }
+
+        /* Progress Display (cleaner CoT) */
+        .progress-container {
+            background: var(--bg-tertiary);
+            border-radius: var(--radius-sm);
+            padding: 0.75rem 1rem;
+            margin: 0.5rem 0;
+            font-family: 'SF Mono', Monaco, 'Consolas', monospace;
+            font-size: 0.85rem;
+        }
+        .progress-header {
+            display: flex;
+            align-items: center;
+            gap: 0.5rem;
+            color: var(--text-secondary);
+            margin-bottom: 0.5rem;
+        }
+        .progress-spinner {
+            display: inline-block;
+            width: 14px;
+            text-align: center;
+        }
+        .progress-list {
+            list-style: none;
+            padding: 0;
+            margin: 0;
+        }
+        .progress-item {
+            display: flex;
+            align-items: flex-start;
+            gap: 0.5rem;
+            padding: 0.25rem 0;
+            color: var(--text-secondary);
+        }
+        .progress-item.active {
+            color: var(--accent);
+        }
+        .progress-item.done {
+            color: var(--success);
+        }
+        .progress-item.error {
+            color: var(--error);
+        }
+        .progress-arrow {
+            flex-shrink: 0;
+        }
+        .progress-text {
+            flex: 1;
+        }
+        .progress-details-toggle {
+            font-size: 0.7rem;
+            color: var(--text-tertiary);
+            cursor: pointer;
+            margin-top: 0.5rem;
+            display: flex;
+            align-items: center;
+            gap: 0.25rem;
+        }
+        .progress-details-toggle:hover {
+            color: var(--text-secondary);
+        }
+        .progress-details {
+            display: none;
+            margin-top: 0.5rem;
+            padding: 0.5rem;
+            background: var(--bg-secondary);
+            border-radius: var(--radius-sm);
+            font-size: 0.75rem;
+            max-height: 200px;
+            overflow-y: auto;
+        }
+        .progress-details.expanded {
+            display: block;
+        }
+        .progress-details pre {
+            margin: 0;
+            white-space: pre-wrap;
+            word-wrap: break-word;
+        }
+        .progress-done .progress-spinner {
+            animation: none;
+        }
+        .progress-done .progress-header {
+            color: var(--success);
+        }
+
         /* Markdown Tables */
         .assistant table {
             border-collapse: collapse;
@@ -567,6 +799,31 @@ HTML_TEMPLATE = '''
         let currentAssistantMessage = null;
         let isProcessing = false;
 
+        // Spinner animation
+        const spinnerFrames = ['⠋', '⠙', '⠹', '⠸', '⠼', '⠴', '⠦', '⠧', '⠇', '⠏'];
+        let spinnerIndex = 0;
+        let spinnerInterval = null;
+
+        function startSpinner() {
+            if (spinnerInterval) return;
+            spinnerInterval = setInterval(() => {
+                const spinners = document.querySelectorAll('.progress-spinner');
+                spinnerIndex = (spinnerIndex + 1) % spinnerFrames.length;
+                spinners.forEach(s => {
+                    if (!s.closest('.progress-done')) {
+                        s.textContent = spinnerFrames[spinnerIndex];
+                    }
+                });
+            }, 80);
+        }
+
+        function stopSpinner() {
+            if (spinnerInterval) {
+                clearInterval(spinnerInterval);
+                spinnerInterval = null;
+            }
+        }
+
         function updateTodos(todos) {
             if (!todos || todos.length === 0) {
                 todoPanel.style.display = 'none';
@@ -628,52 +885,231 @@ HTML_TEMPLATE = '''
             return JSON.stringify(args, null, 2);
         }
 
-        function addToolCallBlock(name, args) {
-            if (!currentAssistantMessage) return;
+        // Translate tool call into human-readable progress message
+        function getProgressMessage(name, args) {
+            // MCPSearch patterns
+            if (name === 'MCPSearch') {
+                const query = args?.query || '';
+                if (query.startsWith('select:') || query.startsWith('load:')) {
+                    const toolName = query.split(':')[1];
+                    return `Loading tool: ${toolName}`;
+                }
+                return `Finding tools for: ${query}`;
+            }
 
-            const block = document.createElement('div');
-            block.className = 'tool-call-block';
-            block.dataset.toolName = name;
+            // TodoWrite
+            if (name === 'TodoWrite') {
+                const count = args?.todos?.length || 0;
+                return `Updating task list (${count} items)`;
+            }
 
-            const desc = getToolDescription(name);
-            const argsStr = formatArgsForDisplay(args);
+            // Inventory tools
+            if (name === 'get_inventory_stock') {
+                const part = args?.part_no || args?.part || 'parts';
+                const site = args?.site || 'all sites';
+                return `Checking inventory: ${part} at ${site}`;
+            }
+            if (name === 'search_inventory_by_warehouse') {
+                const wh = args?.warehouse || args?.warehouse_id || 'warehouse';
+                return `Searching inventory in ${wh}`;
+            }
+            if (name === 'analyze_unreserved_demand_by_warehouse') {
+                const target = args?.target_warehouse || '?';
+                const days = args?.days_ahead || 7;
+                if (args?.auto_create_shipments) {
+                    return `Analyzing ${days}-day demand + creating shipments to ${target}`;
+                }
+                return `Analyzing ${days}-day demand for warehouse ${target}`;
+            }
 
-            block.innerHTML = `
-                <div class="tool-header">
-                    <span class="tool-name">${escapeHtml(name)}</span>
-                    <span class="tool-desc">${escapeHtml(desc)}</span>
-                </div>
-                <div class="tool-section in-section">
-                    <div class="tool-section-label">IN</div>
-                    <pre>${escapeHtml(argsStr) || '(no arguments)'}</pre>
-                </div>
-                <div class="tool-section out-section">
-                    <div class="tool-section-label">OUT</div>
-                    <pre class="tool-result">Running...</pre>
-                </div>
+            // Shipment tools
+            if (name === 'create_shipment_order') {
+                const from = args?.from_warehouse || args?.from || '?';
+                const to = args?.to_warehouse || args?.to || '?';
+                return `Creating shipment: ${from} → ${to}`;
+            }
+            if (name === 'add_shipment_order_line') {
+                const part = args?.part_no || '?';
+                const qty = args?.qty_to_ship || args?.qty || '?';
+                return `Adding line: ${qty}x ${part}`;
+            }
+            if (name === 'release_shipment_order') {
+                const id = args?.shipment_order_id || '?';
+                return `Releasing shipment #${id}`;
+            }
+
+            // Order tools
+            if (name === 'search_customer_orders' || name === 'search_orders') {
+                return `Searching customer orders`;
+            }
+            if (name === 'get_order_details') {
+                const order = args?.order_no || '?';
+                return `Getting details for order ${order}`;
+            }
+            if (name === 'get_order_lines') {
+                const order = args?.order_no || '?';
+                return `Getting lines for order ${order}`;
+            }
+
+            // Default: humanize the tool name
+            return name.replace(/_/g, ' ').replace(/^\w/, c => c.toUpperCase());
+        }
+
+        // Get or create the progress container
+        function getProgressContainer() {
+            if (!currentAssistantMessage) return null;
+
+            let container = currentAssistantMessage.querySelector('.progress-container');
+            if (!container) {
+                container = document.createElement('div');
+                container.className = 'progress-container';
+                container.innerHTML = `
+                    <div class="progress-header">
+                        <span class="progress-spinner">⠋</span>
+                        <span>Agent working...</span>
+                    </div>
+                    <ul class="progress-list"></ul>
+                    <div class="progress-details-toggle" onclick="toggleProgressDetails(this)">
+                        <span>▶</span> Show raw details
+                    </div>
+                    <div class="progress-details">
+                        <pre></pre>
+                    </div>
+                `;
+                currentAssistantMessage.appendChild(container);
+                startSpinner();
+            }
+            return container;
+        }
+
+        function toggleProgressDetails(el) {
+            const details = el.nextElementSibling;
+            if (details.classList.contains('expanded')) {
+                details.classList.remove('expanded');
+                el.innerHTML = '<span>▶</span> Show raw details';
+            } else {
+                details.classList.add('expanded');
+                el.innerHTML = '<span>▼</span> Hide raw details';
+            }
+        }
+
+        // Track raw details for debugging
+        let progressRawDetails = [];
+
+        function addProgressItem(name, args) {
+            const container = getProgressContainer();
+            if (!container) return;
+
+            const list = container.querySelector('.progress-list');
+            const message = getProgressMessage(name, args);
+
+            // Mark previous active item as done
+            const prevActive = list.querySelector('.progress-item.active');
+            if (prevActive) {
+                prevActive.classList.remove('active');
+                prevActive.classList.add('done');
+                prevActive.querySelector('.progress-arrow').textContent = '✓';
+            }
+
+            // Add new item
+            const item = document.createElement('li');
+            item.className = 'progress-item active';
+            item.dataset.toolName = name;
+            item.innerHTML = `
+                <span class="progress-arrow">→</span>
+                <span class="progress-text">${escapeHtml(message)}</span>
             `;
-            currentAssistantMessage.appendChild(block);
+            list.appendChild(item);
+
+            // Store raw details
+            progressRawDetails.push({
+                tool: name,
+                args: args,
+                result: null
+            });
+            updateRawDetails(container);
+
             chatContainer.scrollTop = chatContainer.scrollHeight;
         }
 
-        function updateToolResultBlock(name, result, success) {
-            if (!currentAssistantMessage) return;
+        function updateProgressItem(name, result, success) {
+            const container = currentAssistantMessage?.querySelector('.progress-container');
+            if (!container) return;
 
-            const blocks = currentAssistantMessage.querySelectorAll('.tool-call-block');
-            for (let i = blocks.length - 1; i >= 0; i--) {
-                if (blocks[i].dataset.toolName === name) {
-                    blocks[i].classList.add(success ? 'done' : 'error');
+            const list = container.querySelector('.progress-list');
+            const items = list.querySelectorAll('.progress-item');
 
-                    const resultPre = blocks[i].querySelector('.tool-result');
-                    if (resultPre) {
-                        const resultStr = typeof result === 'string' ? result : JSON.stringify(result, null, 2);
-                        const truncated = resultStr.length > 1500 ? resultStr.substring(0, 1500) + '\\n...(truncated)' : resultStr;
-                        resultPre.textContent = truncated;
-                    }
+            // Find and update the matching item
+            for (let i = items.length - 1; i >= 0; i--) {
+                if (items[i].dataset.toolName === name) {
+                    items[i].classList.remove('active');
+                    items[i].classList.add(success ? 'done' : 'error');
+                    items[i].querySelector('.progress-arrow').textContent = success ? '✓' : '✗';
                     break;
                 }
             }
+
+            // Update raw details
+            for (let i = progressRawDetails.length - 1; i >= 0; i--) {
+                if (progressRawDetails[i].tool === name && progressRawDetails[i].result === null) {
+                    progressRawDetails[i].result = result;
+                    progressRawDetails[i].success = success;
+                    break;
+                }
+            }
+            updateRawDetails(container);
+
             chatContainer.scrollTop = chatContainer.scrollHeight;
+        }
+
+        function updateRawDetails(container) {
+            const detailsPre = container.querySelector('.progress-details pre');
+            if (!detailsPre) return;
+
+            const formatted = progressRawDetails.map((d, i) => {
+                const args = JSON.stringify(d.args, null, 2);
+                const resultStr = d.result !== null
+                    ? (typeof d.result === 'string' ? d.result : JSON.stringify(d.result, null, 2))
+                    : '(pending...)';
+                const truncResult = resultStr.length > 500 ? resultStr.substring(0, 500) + '...' : resultStr;
+                return `[${i + 1}] ${d.tool}\\nIN: ${args}\\nOUT: ${truncResult}`;
+            }).join('\\n\\n');
+
+            detailsPre.textContent = formatted;
+        }
+
+        function finalizeProgress() {
+            stopSpinner();
+
+            const container = currentAssistantMessage?.querySelector('.progress-container');
+            if (!container) return;
+
+            container.classList.add('progress-done');
+            const header = container.querySelector('.progress-header');
+            if (header) {
+                header.innerHTML = '<span>✓</span> <span>Complete</span>';
+            }
+
+            // Mark any remaining active items as done
+            const activeItems = container.querySelectorAll('.progress-item.active');
+            activeItems.forEach(item => {
+                item.classList.remove('active');
+                item.classList.add('done');
+                item.querySelector('.progress-arrow').textContent = '✓';
+            });
+
+            // Reset for next message
+            progressRawDetails = [];
+        }
+
+        function addToolCallBlock(name, args) {
+            // Use new progress display instead of detailed blocks
+            addProgressItem(name, args);
+        }
+
+        function updateToolResultBlock(name, result, success) {
+            // Use new progress display instead of detailed blocks
+            updateProgressItem(name, result, success);
         }
 
         function addThinkingIndicator(step, status) {
@@ -709,6 +1145,7 @@ HTML_TEMPLATE = '''
             currentAssistantMessage.classList.add('streaming');
 
             let fullText = '';
+            let tokenUsage = {input: 0, output: 0};
 
             try {
                 const response = await fetch('/chat', {
@@ -772,6 +1209,11 @@ HTML_TEMPLATE = '''
                                     console.warn('Warning:', event.message);
                                     break;
 
+                                case 'token_usage':
+                                    tokenUsage.input += event.input_tokens || 0;
+                                    tokenUsage.output += event.output_tokens || 0;
+                                    break;
+
                                 case 'error':
                                     if (!fullText) {
                                         fullText = `Error: ${event.message}`;
@@ -786,6 +1228,7 @@ HTML_TEMPLATE = '''
                                     break;
 
                                 case 'done':
+                                    finalizeProgress();
                                     break;
                             }
                         } catch (e) {
@@ -804,6 +1247,17 @@ HTML_TEMPLATE = '''
             }
 
             currentAssistantMessage.classList.remove('streaming');
+
+            // Display token usage if we have any
+            if (tokenUsage.input > 0 || tokenUsage.output > 0) {
+                const total = tokenUsage.input + tokenUsage.output;
+                const cost = ((tokenUsage.input * 0.003 + tokenUsage.output * 0.015) / 1000).toFixed(4);
+                const tokenFooter = document.createElement('div');
+                tokenFooter.className = 'token-footer';
+                tokenFooter.innerHTML = `<span class="token-icon">📊</span> ${tokenUsage.input.toLocaleString()} in / ${tokenUsage.output.toLocaleString()} out · ~$${cost}`;
+                currentAssistantMessage.appendChild(tokenFooter);
+            }
+
             isProcessing = false;
             sendBtn.disabled = false;
             statusDot.classList.remove('active');

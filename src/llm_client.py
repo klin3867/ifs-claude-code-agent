@@ -51,12 +51,14 @@ class AnthropicClient(LLMClient):
         api_key: Optional[str] = None,
         model: str = "claude-sonnet-4-20250514",
         base_url: Optional[str] = None,
+        reasoning_effort: Optional[str] = None,  # Ignored for Anthropic, accepted for compatibility
     ):
         from anthropic import Anthropic
 
         self.api_key = api_key or os.getenv("ANTHROPIC_API_KEY")
         self.base_url = base_url or os.getenv("ANTHROPIC_BASE_URL")
         self.model = model
+        # reasoning_effort is ignored for Anthropic (only used by gpt-oss models)
 
         client_kwargs = {"api_key": self.api_key}
         if self.base_url:
@@ -105,6 +107,10 @@ class AnthropicClient(LLMClient):
             "text": "\n".join(text_content),
             "tool_calls": tool_calls,
             "stop_reason": response.stop_reason,
+            "usage": {
+                "input_tokens": response.usage.input_tokens,
+                "output_tokens": response.usage.output_tokens,
+            }
         }
 
 
@@ -116,12 +122,14 @@ class OpenAIClient(LLMClient):
         api_key: Optional[str] = None,
         model: str = "gpt-4o",
         base_url: Optional[str] = None,
+        reasoning_effort: Optional[str] = None,
     ):
         from openai import OpenAI
 
         self.api_key = api_key or os.getenv("OPENAI_API_KEY")
         self.base_url = base_url or os.getenv("OPENAI_BASE_URL")
         self.model = model
+        self.reasoning_effort = reasoning_effort  # "low", "medium", or "high"
 
         client_kwargs = {"api_key": self.api_key}
         if self.base_url:
@@ -226,6 +234,10 @@ class OpenAIClient(LLMClient):
         if openai_tools:
             kwargs["tools"] = openai_tools
 
+        # gpt-oss models support reasoning_effort: low, medium, high
+        if self.reasoning_effort:
+            kwargs["extra_body"] = {"reasoning_effort": self.reasoning_effort}
+
         response = self.client.chat.completions.create(**kwargs)
         choice = response.choices[0]
 
@@ -251,6 +263,10 @@ class OpenAIClient(LLMClient):
             "text": choice.message.content or "",
             "tool_calls": tool_calls,
             "stop_reason": stop_reason,
+            "usage": {
+                "input_tokens": response.usage.prompt_tokens if response.usage else 0,
+                "output_tokens": response.usage.completion_tokens if response.usage else 0,
+            }
         }
 
 

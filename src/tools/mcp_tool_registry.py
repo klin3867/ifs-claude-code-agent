@@ -538,10 +538,10 @@ TOOL_REGISTRY: Dict[str, ToolSummary] = {
     "analyze_unreserved_demand_by_warehouse": ToolSummary(
         name="analyze_unreserved_demand_by_warehouse",
         server="planning",
-        summary="Strategic analysis: unreserved demand vs warehouse availability",
+        summary="⭐ PRIMARY: Analyze orders shipping this week, check if enough inventory exists, find shortages, auto-create shipment orders to move stock between warehouses (105/110/205)",
         category="planning",
-        mutates=False,
-        use_when="User asks about what needs reservation, sourcing analysis",
+        mutates=True,  # Can create shipments with auto_create_shipments=True
+        use_when="User asks about orders shipping, inventory sufficiency, fulfillment shortfalls, or needs to transfer/move inventory between warehouses. USE THIS instead of multiple get_inventory_stock calls.",
     ),
     
     # =========================================================================
